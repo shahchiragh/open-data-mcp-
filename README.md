@@ -147,6 +147,28 @@ It also ships **skills** (COG/GeoParquet guidance, CRS handling, tool selection,
 SQL) and **steering** workflows (COG conversion, zonal statistics, STAC discover→analyze,
 embedding change detection). See its own `bundle-manifest.json` and `examples/` for details.
 
+### Install it as a Kiro Power
+
+Kiro Powers can be installed straight from GitHub repos. To add the geospatial power on the
+remote machine where you are running Kiro:
+
+1. Copy this link and paste it into your browser on the remote machine (where Kiro runs):
+   [https://github.com/aws-samples/sample-geospatial-kiro-power-pack](https://github.com/aws-samples/sample-geospatial-kiro-power-pack)
+2. Open a new terminal in the workshop folder, clone the repository, and change into it:
+
+   ```bash
+   git clone https://github.com/aws-samples/sample-geospatial-kiro-power-pack.git
+   cd ./sample-geospatial-kiro-power-pack/
+   ```
+
+3. Follow the **Installation** instructions from the repository and install all of the MCP
+   servers listed, then configure them. You do **not** need to create a new `uv` environment —
+   you are already in one that is activated.
+
+Your existing MCP servers are left untouched. Once installation completes, you should have
+the full set of geospatial powers (the hub, data-access, processing, and GeoAI servers listed
+above) available in Kiro.
+
 ---
 
 ## Key takeaways
