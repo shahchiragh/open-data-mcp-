@@ -505,8 +505,12 @@ async def compare_ndvi_sidebyside(
     import matplotlib.pyplot as plt
     from matplotlib.colors import TwoSlopeNorm
 
-    async def _fetch_ndvi(scene_id: str) -> np.ndarray:
-        """Fetch Red and NIR bands for a scene and compute NDVI within bbox."""
+    async def _fetch_ndvi(scene_id: str) -> tuple[np.ndarray, dict]:
+        """Fetch Red and NIR bands for a scene and compute NDVI within bbox.
+
+        Returns:
+            Tuple of (ndvi_array, rasterio_profile) so we can save GeoTIFFs.
+        """
         item_url = stac_url.rstrip("/")
         if item_url.endswith("/items"):
             item_url = f"{item_url}/{scene_id}"
@@ -537,6 +541,18 @@ async def compare_ndvi_sidebyside(
             right, top = transformer.transform(east, north)
             window = from_bounds(left, bottom, right, top, src.transform)
             red = src.read(1, window=window).astype(np.float32)
+            transform = src.window_transform(window)
+            profile = src.profile.copy()
+            profile.update(
+                dtype=rasterio.float32,
+                count=1,
+                compress="deflate",
+                nodata=0.0,
+                transform=transform,
+                height=int(window.height),
+                width=int(window.width),
+                crs=crs,
+            )
 
         with rasterio.open(nir_url) as src:
             crs = src.crs
@@ -548,11 +564,11 @@ async def compare_ndvi_sidebyside(
 
         denom = nir + red
         ndvi = np.where(denom == 0, 0.0, (nir - red) / denom)
-        return np.clip(ndvi, -1.0, 1.0)
+        return np.clip(ndvi, -1.0, 1.0), profile
 
     # Compute NDVI for both scenes
-    ndvi_1 = await _fetch_ndvi(scene_id_1)
-    ndvi_2 = await _fetch_ndvi(scene_id_2)
+    ndvi_1, profile_1 = await _fetch_ndvi(scene_id_1)
+    ndvi_2, profile_2 = await _fetch_ndvi(scene_id_2)
 
     # Handle shape mismatch by trimming to common dimensions
     min_h = min(ndvi_1.shape[0], ndvi_2.shape[0])
@@ -562,6 +578,25 @@ async def compare_ndvi_sidebyside(
 
     # Compute difference (scene2 - scene1)
     diff = ndvi_2 - ndvi_1
+
+    # Determine output paths
+    if not output_path:
+        output_path = f"ndvi_comparison_{scene_id_1[:20]}_vs_{scene_id_2[:20]}.png"
+    base_stem = output_path.rsplit(".", 1)[0]  # strip extension
+    tif_path_1 = f"{base_stem}_scene1.tif"
+    tif_path_2 = f"{base_stem}_scene2.tif"
+    tif_path_diff = f"{base_stem}_diff.tif"
+
+    # Save NDVI GeoTIFFs for later review
+    for arr, profile, path in [
+        (ndvi_1, profile_1, tif_path_1),
+        (ndvi_2, profile_2, tif_path_2),
+        (diff, profile_1, tif_path_diff),
+    ]:
+        p = profile.copy()
+        p.update(height=min_h, width=min_w)
+        with rasterio.open(path, "w", **p) as dst:
+            dst.write(arr, 1)
 
     # Create figure
     n_panels = 3 if show_difference else 2
@@ -593,14 +628,17 @@ async def compare_ndvi_sidebyside(
     plt.tight_layout()
 
     # Save figure
-    if not output_path:
-        output_path = f"ndvi_comparison_{scene_id_1[:20]}_vs_{scene_id_2[:20]}.png"
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
     # Build stats summary
     stats = (
         f"Comparison saved to: {output_path}\n"
+        f"GeoTIFFs saved:\n"
+        f"  Scene 1 NDVI: {tif_path_1}\n"
+        f"  Scene 2 NDVI: {tif_path_2}\n"
+        f"  Difference:   {tif_path_diff}\n"
+        f"\n"
         f"{label_1} — median NDVI: {np.nanmedian(ndvi_1):.3f}, "
         f"mean: {np.nanmean(ndvi_1):.3f}\n"
         f"{label_2} — median NDVI: {np.nanmedian(ndvi_2):.3f}, "
@@ -611,6 +649,138 @@ async def compare_ndvi_sidebyside(
         f"{(diff < -0.1).sum() / diff.size * 100:.1f}%"
     )
     return stats
+
+
+@mcp.tool()
+async def classify_ndvi(
+    input_path: str,
+    output_path: str = "",
+    label: str = "NDVI Classification",
+    save_geotiff: bool = True,
+) -> dict:
+    """Classify an NDVI raster into land cover classes and generate a visualization.
+
+    Applies standard NDVI thresholds (following NASA/deforestation analysis conventions)
+    to categorize pixels into land cover types:
+      - Class 1 (Water):              NDVI < 0
+      - Class 2 (Built-up / Barren):  0 ≤ NDVI < 0.1
+      - Class 3 (Shrub & Grassland):  0.1 ≤ NDVI < 0.3
+      - Class 4 (Sparse Vegetation):  0.3 ≤ NDVI < 0.5
+      - Class 5 (Dense Vegetation):   NDVI ≥ 0.5
+
+    Args:
+        input_path: Path to an NDVI GeoTIFF file (values in [-1, 1]).
+        output_path: Output PNG path for the classification map.
+                     Auto-generated from input filename if empty.
+        label: Title for the classification plot.
+        save_geotiff: If True, also saves the classified raster as a GeoTIFF.
+
+    Returns:
+        A dict with class pixel counts, percentages, output file paths,
+        and classification summary statistics.
+    """
+    import numpy as np
+    import rasterio
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    from matplotlib.patches import Patch
+    import os
+
+    # Read the NDVI raster
+    with rasterio.open(input_path) as src:
+        ndvi = src.read(1).astype(np.float32)
+        profile = src.profile.copy()
+        crs = src.crs
+        transform = src.transform
+
+    # Define classification bins and labels
+    class_bins = [-1.0, 0.0, 0.1, 0.3, 0.5, 1.0]
+    class_names = [
+        "Water",
+        "Built-up / Barren",
+        "Shrub & Grassland",
+        "Sparse Vegetation",
+        "Dense Vegetation",
+    ]
+    class_colors = ["#2166ac", "#d6604d", "#f4a582", "#92c5de", "#1b7837"]
+
+    # Apply classification using digitize (returns class index 1-5)
+    classified = np.digitize(ndvi, bins=class_bins[1:], right=False)
+    # digitize gives 0 for values < first bin edge, and up to len(bins) for values >= last
+    # Remap: values < 0 → class 1, 0-0.1 → class 2, 0.1-0.3 → class 3, 0.3-0.5 → class 4, >=0.5 → class 5
+    classified = np.clip(classified, 1, 5)
+
+    # Compute class statistics
+    total_pixels = ndvi.size
+    class_stats = {}
+    for i, name in enumerate(class_names, start=1):
+        count = int((classified == i).sum())
+        pct = count / total_pixels * 100
+        class_stats[name] = {"class_id": i, "pixel_count": count, "percentage": round(pct, 2)}
+
+    # Determine output paths
+    if not output_path:
+        base = os.path.splitext(os.path.basename(input_path))[0]
+        output_path = f"{base}_classified.png"
+
+    base_stem = output_path.rsplit(".", 1)[0]
+    tif_output_path = f"{base_stem}.tif"
+
+    # Save classified GeoTIFF if requested
+    if save_geotiff:
+        tif_profile = profile.copy()
+        tif_profile.update(
+            dtype=rasterio.uint8,
+            count=1,
+            compress="deflate",
+            nodata=0,
+        )
+        with rasterio.open(tif_output_path, "w", **tif_profile) as dst:
+            dst.write(classified.astype(np.uint8), 1)
+
+    # Create visualization
+    cmap = ListedColormap(class_colors)
+    norm = BoundaryNorm(boundaries=[0.5, 1.5, 2.5, 3.5, 4.5, 5.5], ncolors=5)
+
+    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+    im = ax.imshow(classified, cmap=cmap, norm=norm, interpolation="nearest")
+    ax.set_title(label, fontsize=14, fontweight="bold")
+    ax.axis("off")
+
+    # Build legend
+    legend_patches = [
+        Patch(facecolor=class_colors[i], label=f"{class_names[i]} ({class_stats[class_names[i]]['percentage']:.1f}%)")
+        for i in range(5)
+    ]
+    ax.legend(
+        handles=legend_patches,
+        loc="lower right",
+        fontsize=9,
+        framealpha=0.9,
+        title="Land Cover Class",
+    )
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # Build result
+    result = {
+        "input_path": input_path,
+        "classification_map": output_path,
+        "crs": str(crs) if crs else "unknown",
+        "dimensions": {"height": ndvi.shape[0], "width": ndvi.shape[1]},
+        "total_pixels": total_pixels,
+        "classes": class_stats,
+        "dominant_class": max(class_stats, key=lambda k: class_stats[k]["pixel_count"]),
+    }
+
+    if save_geotiff:
+        result["classified_geotiff"] = tif_output_path
+
+    return result
 
 
 def main():
