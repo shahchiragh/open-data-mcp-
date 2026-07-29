@@ -466,6 +466,333 @@ async def calculate_ndvi(
 
 
 @mcp.tool()
+async def calculate_ndbi(
+    scene_id: str,
+    stac_url: str = "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
+    bbox: list[float] | None = None,
+    output_path: str | None = None,
+) -> dict:
+    """Calculate NDBI (Normalized Difference Built-up Index) for a Sentinel-2 scene.
+
+    NDBI = (SWIR - NIR) / (SWIR + NIR)
+    For Sentinel-2: SWIR = B11 (swir16), NIR = B08 (nir).
+
+    NDBI highlights urban and built-up areas. Values closer to +1 indicate
+    impervious surfaces (concrete, asphalt), while negative values indicate
+    vegetation or water.
+
+    Args:
+        scene_id: The STAC item/scene ID (e.g. "S2A_19TCG_20241219_0_L2A").
+        stac_url: Full STAC collection URL. Defaults to Earth Search
+            Sentinel-2 L2A.
+        bbox: Optional bounding box [west, south, east, north] in EPSG:4326 to
+              clip the calculation to a smaller area. Recommended for large scenes
+              to reduce download time and memory usage.
+        output_path: Optional file path to save the NDBI GeoTIFF. If not
+                     provided, saves to ./ndbi_{scene_id}.tif.
+
+    Returns:
+        A dict with NDBI statistics (min, max, mean, median, std), output file path,
+        CRS, and dimensions. Values range from -1 to +1 where positive values
+        indicate built-up areas.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.windows import from_bounds
+    from pyproj import Transformer
+
+    # Fetch the STAC item to get band URLs
+    item_url = stac_url.rstrip("/")
+    if item_url.endswith("/items"):
+        item_url = f"{item_url}/{scene_id}"
+    else:
+        item_url = f"{item_url}/items/{scene_id}"
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.get(item_url, timeout=30)
+        if resp.status_code == 404:
+            return {"error": f"Scene '{scene_id}' not found at {item_url}"}
+        resp.raise_for_status()
+
+    item = resp.json()
+    assets = item.get("assets", {})
+
+    # Get SWIR (B11) and NIR (B08) band URLs
+    swir_asset = assets.get("swir16") or assets.get("B11") or assets.get("b11")
+    nir_asset = assets.get("nir") or assets.get("B08") or assets.get("b08")
+
+    if not swir_asset:
+        return {"error": "Could not find SWIR band (B11) asset in scene."}
+    if not nir_asset:
+        return {"error": "Could not find NIR band (B08) asset in scene."}
+
+    swir_url = swir_asset.get("href", "")
+    nir_url = nir_asset.get("href", "")
+
+    if not swir_url or not nir_url:
+        return {"error": "Band URLs are empty."}
+
+    # Read SWIR band (20m resolution for Sentinel-2 B11)
+    with rasterio.open(swir_url) as swir_src:
+        swir_profile = swir_src.profile.copy()
+        swir_crs = swir_src.crs
+
+        if bbox:
+            transformer = Transformer.from_crs("EPSG:4326", swir_crs, always_xy=True)
+            left, bottom = transformer.transform(bbox[0], bbox[1])
+            right, top = transformer.transform(bbox[2], bbox[3])
+            window = from_bounds(left, bottom, right, top, swir_src.transform)
+            swir_band = swir_src.read(1, window=window).astype(np.float32)
+            transform = rasterio.windows.transform(window, swir_src.transform)
+        else:
+            swir_band = swir_src.read(1).astype(np.float32)
+            transform = swir_src.transform
+
+    # Read NIR band (10m resolution for Sentinel-2 B08)
+    # We read at the SWIR resolution/extent since SWIR is the coarser band
+    with rasterio.open(nir_url) as nir_src:
+        if bbox:
+            transformer = Transformer.from_crs("EPSG:4326", nir_src.crs, always_xy=True)
+            left, bottom = transformer.transform(bbox[0], bbox[1])
+            right, top = transformer.transform(bbox[2], bbox[3])
+            window = from_bounds(left, bottom, right, top, nir_src.transform)
+            nir_band = nir_src.read(1, window=window).astype(np.float32)
+        else:
+            nir_band = nir_src.read(1).astype(np.float32)
+
+    # Resample NIR to match SWIR dimensions if they differ
+    # (B11 is 20m, B08 is 10m, so NIR array may be ~2x larger)
+    if nir_band.shape != swir_band.shape:
+        from scipy.ndimage import zoom
+        zoom_factors = (
+            swir_band.shape[0] / nir_band.shape[0],
+            swir_band.shape[1] / nir_band.shape[1],
+        )
+        nir_band = zoom(nir_band, zoom_factors, order=1)
+
+    # Calculate NDBI: (SWIR - NIR) / (SWIR + NIR)
+    denominator = swir_band + nir_band
+    ndbi = np.where(denominator == 0, 0.0, (swir_band - nir_band) / denominator)
+
+    # Clip to valid range [-1, 1]
+    ndbi = np.clip(ndbi, -1.0, 1.0)
+
+    # Compute statistics (excluding nodata/zero-denominator areas)
+    valid_mask = denominator > 0
+    if valid_mask.any():
+        ndbi_valid = ndbi[valid_mask]
+        stats = {
+            "min": float(np.min(ndbi_valid)),
+            "max": float(np.max(ndbi_valid)),
+            "mean": float(np.mean(ndbi_valid)),
+            "median": float(np.median(ndbi_valid)),
+            "std": float(np.std(ndbi_valid)),
+        }
+    else:
+        stats = {"min": 0.0, "max": 0.0, "mean": 0.0, "median": 0.0, "std": 0.0}
+
+    # Save NDBI as GeoTIFF
+    if not output_path:
+        output_path = f"./ndbi_{scene_id}.tif"
+
+    swir_profile.update(
+        dtype=rasterio.float32,
+        count=1,
+        compress="deflate",
+        nodata=0.0,
+        transform=transform,
+        height=ndbi.shape[0],
+        width=ndbi.shape[1],
+    )
+
+    with rasterio.open(output_path, "w", **swir_profile) as dst:
+        dst.write(ndbi, 1)
+
+    return {
+        "scene_id": scene_id,
+        "output_path": output_path,
+        "crs": str(swir_crs),
+        "dimensions": {"height": ndbi.shape[0], "width": ndbi.shape[1]},
+        "statistics": stats,
+        "interpretation": {
+            "positive_values": "Built-up / impervious surfaces (concrete, asphalt)",
+            "near_zero": "Bare soil or mixed land use",
+            "negative_values": "Vegetation or water bodies",
+        },
+    }
+
+
+@mcp.tool()
+async def compare_ndbi_sidebyside(
+    scene_id_1: str,
+    scene_id_2: str,
+    bbox: list[float],
+    label_1: str = "Scene 1",
+    label_2: str = "Scene 2",
+    show_difference: bool = True,
+    colormap: str = "RdYlGn_r",
+    output_path: str = "",
+    stac_url: str = "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
+) -> str:
+    """Generate a side-by-side NDBI comparison plot for two Sentinel-2 scenes.
+
+    Computes NDBI for both scenes within the given bounding box, then produces
+    a multi-panel PNG figure showing each scene's NDBI and optionally the difference.
+    Useful for detecting urban expansion or changes in built-up areas over time.
+
+    Args:
+        scene_id_1: First Sentinel-2 scene ID (e.g. baseline/before development).
+        scene_id_2: Second Sentinel-2 scene ID (e.g. after development).
+        bbox: Bounding box [west, south, east, north] in EPSG:4326.
+        label_1: Label for the first scene panel.
+        label_2: Label for the second scene panel.
+        show_difference: If True, adds a third panel showing NDBI difference.
+        colormap: Matplotlib colormap for NDBI panels (default: RdYlGn_r,
+                  reversed so red=built-up, green=vegetation).
+        output_path: Output PNG path. Auto-generated if empty.
+        stac_url: STAC collection URL. Defaults to Sentinel-2 L2A on Earth Search.
+
+    Returns:
+        Summary string with output file path and basic NDBI statistics.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.windows import from_bounds
+    from pyproj import Transformer
+    from scipy.ndimage import zoom
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    async def _fetch_ndbi(scene_id: str) -> tuple[np.ndarray, dict]:
+        """Fetch SWIR and NIR bands for a scene and compute NDBI within bbox."""
+        item_url = stac_url.rstrip("/")
+        if item_url.endswith("/items"):
+            item_url = f"{item_url}/{scene_id}"
+        else:
+            item_url = f"{item_url}/items/{scene_id}"
+
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp = await client.get(item_url, timeout=30)
+            resp.raise_for_status()
+
+        item = resp.json()
+        assets = item.get("assets", {})
+
+        swir_asset = assets.get("swir16") or assets.get("B11") or assets.get("b11")
+        nir_asset = assets.get("nir") or assets.get("B08") or assets.get("b08")
+        if not swir_asset or not nir_asset:
+            raise ValueError(f"Cannot find SWIR/NIR bands for scene {scene_id}")
+
+        swir_url = swir_asset["href"]
+        nir_url = nir_asset["href"]
+
+        west, south, east, north = bbox
+
+        with rasterio.open(swir_url) as src:
+            crs = src.crs
+            transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+            left, bottom = transformer.transform(west, south)
+            right, top = transformer.transform(east, north)
+            window = from_bounds(left, bottom, right, top, src.transform)
+            swir = src.read(1, window=window).astype(np.float32)
+            transform = src.window_transform(window)
+            profile = src.profile.copy()
+            profile.update(
+                dtype=rasterio.float32,
+                count=1,
+                compress="deflate",
+                nodata=0.0,
+                transform=transform,
+                height=int(window.height),
+                width=int(window.width),
+                crs=crs,
+            )
+
+        with rasterio.open(nir_url) as src:
+            crs = src.crs
+            transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+            left, bottom = transformer.transform(west, south)
+            right, top = transformer.transform(east, north)
+            window = from_bounds(left, bottom, right, top, src.transform)
+            nir = src.read(1, window=window).astype(np.float32)
+
+        # Resample NIR to match SWIR dimensions (B11=20m, B08=10m)
+        if nir.shape != swir.shape:
+            zoom_factors = (swir.shape[0] / nir.shape[0], swir.shape[1] / nir.shape[1])
+            nir = zoom(nir, zoom_factors, order=1)
+
+        denom = swir + nir
+        ndbi = np.where(denom == 0, 0.0, (swir - nir) / denom)
+        return np.clip(ndbi, -1.0, 1.0), profile
+
+    # Compute NDBI for both scenes
+    ndbi_1, profile_1 = await _fetch_ndbi(scene_id_1)
+    ndbi_2, profile_2 = await _fetch_ndbi(scene_id_2)
+
+    # Handle shape mismatch by trimming to common dimensions
+    min_h = min(ndbi_1.shape[0], ndbi_2.shape[0])
+    min_w = min(ndbi_1.shape[1], ndbi_2.shape[1])
+    ndbi_1 = ndbi_1[:min_h, :min_w]
+    ndbi_2 = ndbi_2[:min_h, :min_w]
+
+    # Compute difference (scene2 - scene1)
+    diff = ndbi_2 - ndbi_1
+
+    # Determine output path
+    if not output_path:
+        output_path = f"ndbi_comparison_{scene_id_1[:20]}_vs_{scene_id_2[:20]}.png"
+
+    # Create figure
+    n_panels = 3 if show_difference else 2
+    fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 6))
+
+    # Panel 1 — first scene
+    im1 = axes[0].imshow(ndbi_1, cmap=colormap, vmin=-1, vmax=1)
+    axes[0].set_title(label_1, fontsize=13, fontweight="bold")
+    axes[0].axis("off")
+    plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04, label="NDBI")
+
+    # Panel 2 — second scene
+    im2 = axes[1].imshow(ndbi_2, cmap=colormap, vmin=-1, vmax=1)
+    axes[1].set_title(label_2, fontsize=13, fontweight="bold")
+    axes[1].axis("off")
+    plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04, label="NDBI")
+
+    # Panel 3 — difference
+    if show_difference:
+        vmax_diff = max(abs(float(diff.min())), abs(float(diff.max())), 0.01)
+        norm = TwoSlopeNorm(vmin=-vmax_diff, vcenter=0, vmax=vmax_diff)
+        im3 = axes[2].imshow(diff, cmap="RdBu_r", norm=norm)
+        axes[2].set_title(
+            f"Difference ({label_2} \u2212 {label_1})", fontsize=13, fontweight="bold"
+        )
+        axes[2].axis("off")
+        plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04, label="\u0394NDBI")
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # Build stats summary
+    stats = (
+        f"NDBI Comparison saved to: {output_path}\n\n"
+        f"{label_1} — median NDBI: {np.nanmedian(ndbi_1):.3f}, "
+        f"mean: {np.nanmean(ndbi_1):.3f}\n"
+        f"{label_2} — median NDBI: {np.nanmedian(ndbi_2):.3f}, "
+        f"mean: {np.nanmean(ndbi_2):.3f}\n"
+        f"Difference — median \u0394NDBI: {np.nanmedian(diff):.3f}, "
+        f"mean: {np.nanmean(diff):.3f}\n"
+        f"Pixels with increased built-up (\u0394NDBI > 0.05): "
+        f"{(diff > 0.05).sum() / diff.size * 100:.1f}%\n"
+        f"Pixels with decreased built-up (\u0394NDBI < -0.05): "
+        f"{(diff < -0.05).sum() / diff.size * 100:.1f}%"
+    )
+    return stats
+
+
+@mcp.tool()
 async def compare_ndvi_sidebyside(
     scene_id_1: str,
     scene_id_2: str,
