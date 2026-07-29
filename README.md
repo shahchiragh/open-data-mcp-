@@ -1,4 +1,4 @@
-# Geospatial AI Workshop — Open Data MCP, Drought Analysis & FloodGuard Agent
+# Geospatial MCP Build — Open Data MCP, Drought Analysis & FloodGuard Agent
 
 A hands-on exploration of geospatial AI built with [Kiro](https://kiro.dev). This repo
 brings together three things that build on each other:
@@ -14,7 +14,8 @@ brings together three things that build on each other:
    **Geospatial Kiro Power Pack** used to give Kiro itself geospatial superpowers.
 
 > If you want the story of *how* this was built — the prompts, the tools added, the agent
-> powers wired up — see [`INTERACTIONS.md`](./INTERACTIONS.md).
+> powers wired up — see [`INTERACTIONS.md`](./INTERACTIONS.md). For the verbatim lab
+> instructions and prompts, see [`GEOSPATIAL_MCP_BUILD_LABS.md`](./GEOSPATIAL_MCP_BUILD_LABS.md).
 
 ---
 

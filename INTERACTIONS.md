@@ -154,8 +154,8 @@ The pack (`sample-geospatial-kiro-power-pack/`) provides:
   embedding) and **steering** workflows (COG conversion, zonal stats, STAC discover→analyze,
   embedding change detection, geocode→route).
 
-These tools were used in this workshop to search datasets, compute indices, and run the
-change-detection style analyses reflected in the Shasta and FloodGuard work.
+These tools were used in this Geospatial MCP Build to search datasets, compute indices, and
+run the change-detection style analyses reflected in the Shasta and FloodGuard work.
 
 ---
 
