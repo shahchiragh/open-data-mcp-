@@ -1,0 +1,1 @@
+A policyholder named Keola in Kihei, Maui was flooded during the March 2026 Kona storm. As our claims support assistant, find Sentinel-2 imagery before (early March 2026) and after (late March 2026) the event, estimate how much new flooding occurred near Kihei using a small analysis area, and give a preliminary claim triage. Cite the scene IDs and dates you used.

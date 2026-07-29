@@ -1,0 +1,17 @@
+{
+  "targets": {
+    "prod": {
+      "resources": {
+        "runtimes": {
+          "floodguard": {
+            "runtimeId": "floodguard_floodguard-5pF5cg5iwv",
+            "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:597288150864:runtime/floodguard_floodguard-5pF5cg5iwv",
+            "roleArn": "arn:aws:iam::597288150864:role/AgentCore-floodguard-prod-ApplicationAgentFloodguar-ZdSlosQFkU3O"
+          }
+        },
+        "stackName": "AgentCore-floodguard-prod",
+        "deployHash": "75f98ecd33ce50ca"
+      }
+    }
+  }
+}
