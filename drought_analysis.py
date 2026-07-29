@@ -3,6 +3,7 @@ Shasta Lake Drought Analysis — NDVI Comparison
 Compares 2017 (recovery year) vs 2021 (extreme drought year)
 using Sentinel-2 derived NDVI.
 """
+import os
 import numpy as np
 import rasterio
 import matplotlib
@@ -43,9 +44,12 @@ def compute_stats(ndvi: np.ndarray, label: str) -> dict:
 
 
 def main():
+    output_dir = "output"
+    os.makedirs(output_dir, exist_ok=True)
+
     # Load both NDVI rasters
-    ndvi_2017, _ = load_ndvi("ndvi_shasta_2017_recovery.tif")
-    ndvi_2021, profile = load_ndvi("ndvi_shasta_2021_drought.tif")
+    ndvi_2017, _ = load_ndvi(os.path.join(output_dir, "ndvi_shasta_2017_recovery.tif"))
+    ndvi_2021, profile = load_ndvi(os.path.join(output_dir, "ndvi_shasta_2021_drought.tif"))
 
     # Compute stats
     stats_2017 = compute_stats(ndvi_2017, "2017 (Recovery)")
@@ -57,7 +61,8 @@ def main():
     # Save difference raster
     diff_profile = profile.copy()
     diff_profile.update(dtype=rasterio.float32, count=1, compress="deflate")
-    with rasterio.open("ndvi_shasta_diff_2021_vs_2017.tif", "w", **diff_profile) as dst:
+    diff_path = os.path.join(output_dir, "ndvi_shasta_diff_2021_vs_2017.tif")
+    with rasterio.open(diff_path, "w", **diff_profile) as dst:
         dst.write(ndvi_diff.astype(np.float32), 1)
 
     # --- Print Analysis Report ---
@@ -139,9 +144,10 @@ def main():
     plt.suptitle("Shasta Lake, CA — Drought Impact on Vegetation (NDVI)",
                  fontsize=14, fontweight="bold", y=0.98)
     plt.tight_layout()
-    plt.savefig("shasta_drought_ndvi_comparison.png", dpi=150, bbox_inches="tight")
-    print(f"\n  💾 Figure saved: shasta_drought_ndvi_comparison.png")
-    print(f"  💾 Difference raster: ndvi_shasta_diff_2021_vs_2017.tif")
+    fig_path = os.path.join(output_dir, "shasta_drought_ndvi_comparison.png")
+    plt.savefig(fig_path, dpi=150, bbox_inches="tight")
+    print(f"\n  💾 Figure saved: {fig_path}")
+    print(f"  💾 Difference raster: {diff_path}")
 
 
 if __name__ == "__main__":
