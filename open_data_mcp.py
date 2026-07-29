@@ -465,6 +465,154 @@ async def calculate_ndvi(
     }
 
 
+@mcp.tool()
+async def compare_ndvi_sidebyside(
+    scene_id_1: str,
+    scene_id_2: str,
+    bbox: list[float],
+    label_1: str = "Scene 1",
+    label_2: str = "Scene 2",
+    show_difference: bool = True,
+    colormap: str = "RdYlGn",
+    output_path: str = "",
+    stac_url: str = "https://earth-search.aws.element84.com/v1/collections/sentinel-2-l2a",
+) -> str:
+    """Generate a side-by-side NDVI comparison plot for two Sentinel-2 scenes.
+
+    Computes NDVI for both scenes within the given bounding box, then produces
+    a multi-panel PNG figure showing each scene's NDVI and optionally the difference.
+
+    Args:
+        scene_id_1: First Sentinel-2 scene ID (e.g. recovery/baseline year).
+        scene_id_2: Second Sentinel-2 scene ID (e.g. drought/event year).
+        bbox: Bounding box [west, south, east, north] in EPSG:4326.
+        label_1: Label for the first scene panel.
+        label_2: Label for the second scene panel.
+        show_difference: If True, adds a third panel showing NDVI difference.
+        colormap: Matplotlib colormap for NDVI panels (default: RdYlGn).
+        output_path: Output PNG path. Auto-generated if empty.
+        stac_url: STAC collection URL. Defaults to Sentinel-2 L2A on Earth Search.
+
+    Returns:
+        Summary string with output file path and basic NDVI statistics.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.windows import from_bounds
+    from pyproj import Transformer
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    async def _fetch_ndvi(scene_id: str) -> np.ndarray:
+        """Fetch Red and NIR bands for a scene and compute NDVI within bbox."""
+        item_url = stac_url.rstrip("/")
+        if item_url.endswith("/items"):
+            item_url = f"{item_url}/{scene_id}"
+        else:
+            item_url = f"{item_url}/items/{scene_id}"
+
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            resp = await client.get(item_url, timeout=30)
+            resp.raise_for_status()
+
+        item = resp.json()
+        assets = item.get("assets", {})
+
+        red_asset = assets.get("red") or assets.get("B04") or assets.get("b04")
+        nir_asset = assets.get("nir") or assets.get("B08") or assets.get("b08")
+        if not red_asset or not nir_asset:
+            raise ValueError(f"Cannot find Red/NIR bands for scene {scene_id}")
+
+        red_url = red_asset["href"]
+        nir_url = nir_asset["href"]
+
+        west, south, east, north = bbox
+
+        with rasterio.open(red_url) as src:
+            crs = src.crs
+            transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+            left, bottom = transformer.transform(west, south)
+            right, top = transformer.transform(east, north)
+            window = from_bounds(left, bottom, right, top, src.transform)
+            red = src.read(1, window=window).astype(np.float32)
+
+        with rasterio.open(nir_url) as src:
+            crs = src.crs
+            transformer = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+            left, bottom = transformer.transform(west, south)
+            right, top = transformer.transform(east, north)
+            window = from_bounds(left, bottom, right, top, src.transform)
+            nir = src.read(1, window=window).astype(np.float32)
+
+        denom = nir + red
+        ndvi = np.where(denom == 0, 0.0, (nir - red) / denom)
+        return np.clip(ndvi, -1.0, 1.0)
+
+    # Compute NDVI for both scenes
+    ndvi_1 = await _fetch_ndvi(scene_id_1)
+    ndvi_2 = await _fetch_ndvi(scene_id_2)
+
+    # Handle shape mismatch by trimming to common dimensions
+    min_h = min(ndvi_1.shape[0], ndvi_2.shape[0])
+    min_w = min(ndvi_1.shape[1], ndvi_2.shape[1])
+    ndvi_1 = ndvi_1[:min_h, :min_w]
+    ndvi_2 = ndvi_2[:min_h, :min_w]
+
+    # Compute difference (scene2 - scene1)
+    diff = ndvi_2 - ndvi_1
+
+    # Create figure
+    n_panels = 3 if show_difference else 2
+    fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 6))
+
+    # Panel 1 — first scene
+    im1 = axes[0].imshow(ndvi_1, cmap=colormap, vmin=-1, vmax=1)
+    axes[0].set_title(label_1, fontsize=13, fontweight="bold")
+    axes[0].axis("off")
+    plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04, label="NDVI")
+
+    # Panel 2 — second scene
+    im2 = axes[1].imshow(ndvi_2, cmap=colormap, vmin=-1, vmax=1)
+    axes[1].set_title(label_2, fontsize=13, fontweight="bold")
+    axes[1].axis("off")
+    plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04, label="NDVI")
+
+    # Panel 3 — difference
+    if show_difference:
+        vmax_diff = max(abs(float(diff.min())), abs(float(diff.max())), 0.01)
+        norm = TwoSlopeNorm(vmin=-vmax_diff, vcenter=0, vmax=vmax_diff)
+        im3 = axes[2].imshow(diff, cmap="RdBu", norm=norm)
+        axes[2].set_title(
+            f"Difference ({label_2} \u2212 {label_1})", fontsize=13, fontweight="bold"
+        )
+        axes[2].axis("off")
+        plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04, label="\u0394NDVI")
+
+    plt.tight_layout()
+
+    # Save figure
+    if not output_path:
+        output_path = f"ndvi_comparison_{scene_id_1[:20]}_vs_{scene_id_2[:20]}.png"
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    # Build stats summary
+    stats = (
+        f"Comparison saved to: {output_path}\n"
+        f"{label_1} — median NDVI: {np.nanmedian(ndvi_1):.3f}, "
+        f"mean: {np.nanmean(ndvi_1):.3f}\n"
+        f"{label_2} — median NDVI: {np.nanmedian(ndvi_2):.3f}, "
+        f"mean: {np.nanmean(ndvi_2):.3f}\n"
+        f"Difference — median \u0394NDVI: {np.nanmedian(diff):.3f}, "
+        f"mean: {np.nanmean(diff):.3f}\n"
+        f"Pixels degraded (\u0394NDVI < -0.1): "
+        f"{(diff < -0.1).sum() / diff.size * 100:.1f}%"
+    )
+    return stats
+
+
 def main():
     mcp.run(transport="stdio")
 
